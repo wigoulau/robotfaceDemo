@@ -71,9 +71,12 @@ POSE = {
 
 def mix_pose(viseme, rms):
     pose = POSE[viseme]
-    center = 1100
+    center = 1450  # S3 闭合位置
     jaw_target = pose[3]
-    jaw = int(center + (jaw_target - center) * (0.3 + rms * 0.7))
+    # rms 越大 → factor 越大 → jaw 越接近 target（张嘴）
+    # rms=0 → factor=0.3 (微张), rms=1 → factor=1.0 (全开到目标)
+    factor = 0.3 + rms * 0.7
+    jaw = int(center + (jaw_target - center) * factor)
     result = dict(pose)
     result[3] = jaw
     return result
@@ -108,7 +111,8 @@ class ServoEngine:
         if self.ctrl:
             for sid, pwm in pose.items():
                 # 硬件舵机自带速度控制 (send_pwm 第3个参数为速度)
-                self.ctrl.send_pwm(sid, int(pwm), 50)
+                if sid in (3, 0):
+                    self.ctrl.send_pwm(sid, int(pwm), 50)
 
         if self.face:
             if self.interpolator:
