@@ -4,11 +4,7 @@ import queue
 import wave
 import sys
 
-import numpy as np
-import sounddevice as sd
-
-from pypinyin import lazy_pinyin
-from piper.voice import PiperVoice
+# numpy, sounddevice, pypinyin 延迟到实际需要时再导入
 
 # 延迟加载模型（在后台线程中）
 voice = None
@@ -17,16 +13,16 @@ voice_ready = threading.Event()
 def _load_voice_async():
     global voice
     try:
+        from piper.voice import PiperVoice
         voice = PiperVoice.load("models/tts/zh_CN-huayan-medium.onnx")
         voice_ready.set()
     except Exception as e:
         print(f"[ERR] 模型加载失败: {e}")
 
 # ==========================
-# 导入舵机控制器 + 面部显示
+# 仅导入轻量模块
 # ==========================
 
-from servo_controller import ServoController
 from face_display import FaceDisplay
 from servo_interpolator import ServoInterpolator
 
@@ -52,6 +48,7 @@ def pinyin_to_viseme(py):
 
 
 def text_to_visemes(text):
+    from pypinyin import lazy_pinyin
     pys = lazy_pinyin(text)
     return [pinyin_to_viseme(x) for x in pys]
 
@@ -87,6 +84,7 @@ def mix_pose(viseme, rms):
 # ==========================
 
 def calc_rms(chunk):
+    import numpy as np
     audio = chunk.astype(np.float32)
     rms = np.sqrt(np.mean(audio * audio))
     rms /= 32768.0
@@ -185,51 +183,72 @@ class NeckThread(threading.Thread):
 
 def play_wav_with_servo(wav_file, visemes, servo_engine, stop_event):
     """播放WAV并同步舵机。stop_event 被 set() 时立即停止。"""
+    import numpy as np
+    import sounddevice as sd
 
     wf = wave.open(wav_file, "rb")
     sr = wf.getframerate()
     total_frames = wf.getnframes()
     
-    # 播放速度：0.8 = 80%速度（更慢）, 1.0 = 原速
+    # 播放速度：0.7 = 70%速度
     PLAYBACK_SPEED = 0.7
+    output_sr = int(sr * PLAYBACK_SPEED)
     
-    # 计算实际播放时长和步长
+    # 计算步长
     actual_duration = (total_frames / sr) / PLAYBACK_SPEED
     viseme_step = actual_duration / max(len(visemes), 1)
     
     chunk_size = 1024
+    SERVO_INTERVAL = 0.08  # 80ms 节流，更跟手
 
-    # 舵机更新节流：每 150ms 才发送一次舵机指令
-    SERVO_INTERVAL = 0.15
-    last_servo_time = 0
-
-    # 输出采样率降低以实现慢速播放
-    output_sr = int(sr * PLAYBACK_SPEED)
+    # 预读所有音频数据
+    all_data = wf.readframes(total_frames)
+    wf.close()
+    audio_array = np.frombuffer(all_data, dtype=np.int16)
     
-    stream = sd.OutputStream(samplerate=output_sr, channels=1, dtype=np.int16)
+    # 使用回调模式播放，精确跟踪已播放帧数
+    playback_pos = [0]  # 用列表以便在闭包中修改
+    data_event = threading.Event()
+
+    def audio_callback(outdata, frame_count, time_info, status):
+        start = playback_pos[0]
+        end = start + frame_count
+        if end <= len(audio_array):
+            outdata[:, 0] = audio_array[start:end]
+        else:
+            remaining = len(audio_array) - start
+            if remaining > 0:
+                outdata[:remaining, 0] = audio_array[start:start + remaining]
+            outdata[remaining:, 0] = 0
+        playback_pos[0] = min(end, len(audio_array))
+        data_event.set()
+
+    stream = sd.OutputStream(
+        samplerate=output_sr, channels=1, dtype=np.int16,
+        callback=audio_callback, blocksize=chunk_size
+    )
     stream.start()
 
-    # 跟踪已写入帧数，用于精确同步
-    frames_written = 0
-
+    last_servo_time = 0
     try:
-        while not stop_event.is_set():
-            data = wf.readframes(chunk_size)
-            if len(data) == 0:
-                break
+        while not stop_event.is_set() and playback_pos[0] < len(audio_array):
+            data_event.wait(timeout=0.05)
+            data_event.clear()
 
-            chunk = np.frombuffer(data, dtype=np.int16)
-            stream.write(chunk)
-            frames_written += len(chunk)
-
-            # 节流：只在间隔足够时才更新舵机
             now = time.time()
             if now - last_servo_time >= SERVO_INTERVAL:
-                rms = calc_rms(chunk)
-                
-                # 基于已写入帧数计算当前音频位置（更精确）
-                current_audio_time = frames_written / output_sr
+                # 基于实际已播放帧数计算位置
+                played_frames = playback_pos[0]
+                current_audio_time = played_frames / output_sr
                 idx = min(int(current_audio_time / viseme_step), len(visemes) - 1)
+
+                # 取当前位置附近的音频计算 RMS
+                sample_start = max(0, played_frames - chunk_size)
+                sample_end = min(played_frames, len(audio_array))
+                if sample_end > sample_start:
+                    rms = calc_rms(audio_array[sample_start:sample_end])
+                else:
+                    rms = 0.0
 
                 viseme = visemes[idx]
                 pose = mix_pose(viseme, rms)
@@ -237,7 +256,7 @@ def play_wav_with_servo(wav_file, visemes, servo_engine, stop_event):
                 last_servo_time = now
     finally:
         stream.stop()
-        wf.close()
+        stream.close()
 
 
 # ==========================
@@ -261,18 +280,14 @@ def main():
     # ---- 后台加载语音模型 ----
     threading.Thread(target=_load_voice_async, daemon=True).start()
     
-    # ---- 启动 GUI（必须在主线程）----
+    # ---- 创建 GUI（主线程运行 tkinter）----
     face_display = FaceDisplay()
-    face_display.start_in_thread()
     
-    # 等 tkinter 就绪
-    while face_display.root is None:
-        time.sleep(0.01)
-    time.sleep(0.2)
+    # 等 tkinter root 创建后（在 _tk_main 调用前）启动后台逻辑
+    # 使用 after 回调来确保 tkinter 初始化完成
     
     # ---- 创建插值器 ----
     interpolator = ServoInterpolator(mode=INTERP_MODE)
-    face_display.interpolator = interpolator
 
     # ---- 后台逻辑循环 ----
     stop_event = threading.Event()
@@ -284,24 +299,34 @@ def main():
     def _logic_loop():
         nonlocal bg_started, speak_thread, ctrl, connected
 
-        # 等 tkinter 就绪后再连接舵机（避免 hidapi 与 tkinter 初始化冲突）
+        # 等 tkinter 就绪后赋值插值器（不连接舵机，避免阻塞 GUI）
         while face_display.root is None:
             time.sleep(0.01)
         time.sleep(0.3)
+        face_display.interpolator = interpolator
 
-        ctrl_obj = ServoController()
-        connected = ctrl_obj.connect()
-        ctrl = ctrl_obj if connected else None
+        servo_engine = ServoEngine(None, face_display, interpolator)
 
-        if not connected:
-            print("[!] 舵机未连接，仅运行模拟显示模式")
-            face_display.set_status("模拟模式 - 无硬件连接")
-
-        servo_engine = ServoEngine(
-            ctrl if connected else None,
-            face_display,
-            interpolator
-        )
+        def _ensure_servo():
+            """首次说话时才连接舵机（避免 hid 扫描卡住 GUI）"""
+            nonlocal ctrl, connected, servo_engine
+            if ctrl is not None or connected:
+                return
+            try:
+                from servo_controller import ServoController
+                ctrl_obj = ServoController()
+                connected = ctrl_obj.connect()
+                ctrl = ctrl_obj if connected else None
+                if not connected:
+                    print("[!] 舵机未连接，仅运行模拟显示模式")
+                    face_display.set_status("模拟模式 - 无硬件连接")
+                servo_engine = ServoEngine(
+                    ctrl if connected else None,
+                    face_display,
+                    interpolator
+                )
+            except Exception as e:
+                print(f"[ERR] 舵机连接失败: {e}")
 
         while True:
             cmd = face_display.get_text_input(timeout=0.05)
@@ -364,6 +389,9 @@ def main():
             if not text:
                 continue
 
+            # 首次说话时连接舵机
+            _ensure_servo()
+
             # 首次说话时启动后台线程
             if connected and not bg_started:
                 # BlinkThread(ctrl, face_display).start()   # 眨眼 - 已暂停
@@ -393,7 +421,7 @@ def main():
     logic_thread.start()
 
     # ---- 主线程运行 tkinter（阻塞直到窗口关闭）----
-    face_display._tk_main()
+    face_display.start()
 
     # ---- 清理 ----
     if ctrl and connected:

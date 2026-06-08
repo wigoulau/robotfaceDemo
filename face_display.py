@@ -11,6 +11,8 @@ import queue
 import tkinter as tk
 import math
 
+from servo_interpolator import ServoInterpolator
+
 # ==========================
 # 舵机ID → 视觉参数映射
 # ==========================
@@ -91,10 +93,13 @@ class FaceDisplay:
     """面部模拟显示 (GUI 驱动)"""
 
     def __init__(self):
-        self.queue = queue.Queue()       # 舵机 PWM 更新队列
+        self.queue = queue.Queue()       # 舵机 PWM 更新队列（原始目标值）
         self.text_queue = queue.Queue()  # 文本输入队列: "text" / "__stop__" / "__exit__"
         self.servo_cmd_queue = queue.Queue()  # 滑杆发出的舵机指令 (sid, pwm)
         self.ui_cmd_queue = queue.Queue()     # 跨线程 UI 命令队列（只在主线程消费）
+
+        # 插值器（外部注入，或由 _tk_main 创建默认实例）
+        self.interpolator = None
 
         self.root = None
         self.canvas = None
@@ -145,7 +150,25 @@ class FaceDisplay:
         self._running = False
         self.ui_cmd_queue.put(("stop", None))
 
-    # ---- 外部调用：更新舵机 PWM ----
+    # ---- 外部调用：设置舵机目标（通过插值器平滑）----
+    def set_target(self, servo_id, pwm, speed=None, preset="mouth"):
+        """设置舵机目标 PWM，由插值器平滑过渡"""
+        if self.interpolator:
+            self.interpolator.set_target(servo_id, pwm, speed=speed, preset=preset)
+        else:
+            self.queue.put((servo_id, pwm))  # 无插值器时回退到队列
+
+    def set_pose_target(self, pose, preset="mouth"):
+        """批量设置多个舵机目标"""
+        for sid, pwm in pose.items():
+            self.set_target(sid, pwm, preset=preset)
+
+    def set_instant(self, servo_id, pwm):
+        """即时设置（无插值）"""
+        if self.interpolator:
+            self.interpolator.set_instant(servo_id, pwm)
+
+    # ---- 兼容旧接口（直接放入队列，由 _poll_queue 转发给插值器）----
     def update_servo(self, servo_id, pwm):
         self.queue.put((servo_id, pwm))
 
@@ -194,6 +217,10 @@ class FaceDisplay:
     # ==============================
 
     def _tk_main(self):
+        # 创建默认插值器（外部未注入时）
+        if self.interpolator is None:
+            self.interpolator = ServoInterpolator(mode="lerp")
+
         self.root = tk.Tk()
         self.root.title("Robot Face - 模拟显示")
         self.root.resizable(False, False)
@@ -386,16 +413,26 @@ class FaceDisplay:
             self.stop_btn.config(state=tk.DISABLED, bg="#666666")
             self.status_label.config(text="就绪 - 请输入文本")
 
-    # ---- 轮询队列 ----
+    # ---- 轮询队列 + 插值器 ----
     def _poll_queue(self):
+        # 1. 将队列中的原始目标值转发给插值器
         try:
             while True:
                 sid, pwm = self.queue.get_nowait()
-                self._apply_servo(sid, pwm)
+                if self.interpolator:
+                    self.interpolator.set_target(sid, pwm, preset="mouth")
+                else:
+                    self._apply_servo(sid, pwm)  # 无插值器时直接应用
         except queue.Empty:
             pass
 
-        # 处理跨线程 UI 命令（只在主线程执行，线程安全）
+        # 2. 插值器 tick：获取平滑后的值并应用
+        if self.interpolator:
+            updates = self.interpolator.tick()
+            for sid, pwm in updates.items():
+                self._apply_servo(sid, pwm)
+
+        # 3. 处理跨线程 UI 命令（只在主线程执行，线程安全）
         try:
             while True:
                 cmd, data = self.ui_cmd_queue.get_nowait()
@@ -415,7 +452,7 @@ class FaceDisplay:
 
         if self._running:
             self._redraw_all()
-            self.root.after(16, self._poll_queue)
+            self.root.after(50, self._poll_queue)  # 50ms = 20fps，减少主线程压力
 
     # ---- 应用舵机值 ----
     def _apply_servo(self, servo_id, pwm):
