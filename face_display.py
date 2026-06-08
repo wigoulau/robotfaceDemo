@@ -94,6 +94,7 @@ class FaceDisplay:
         self.queue = queue.Queue()       # 舵机 PWM 更新队列
         self.text_queue = queue.Queue()  # 文本输入队列: "text" / "__stop__" / "__exit__"
         self.servo_cmd_queue = queue.Queue()  # 滑杆发出的舵机指令 (sid, pwm)
+        self.ui_cmd_queue = queue.Queue()     # 跨线程 UI 命令队列（只在主线程消费）
 
         self.root = None
         self.canvas = None
@@ -142,8 +143,7 @@ class FaceDisplay:
 
     def stop(self):
         self._running = False
-        if self.root:
-            self.root.after(0, self.root.destroy)
+        self.ui_cmd_queue.put(("stop", None))
 
     # ---- 外部调用：更新舵机 PWM ----
     def update_servo(self, servo_id, pwm):
@@ -168,15 +168,13 @@ class FaceDisplay:
         except queue.Empty:
             return None
 
-    # ---- 设置说话状态 ----
+    # ---- 设置说话状态（线程安全，通过队列）----
     def set_speaking(self, speaking):
         self._speaking = speaking
-        if self.root:
-            self.root.after(0, self._update_ui_state)
+        self.ui_cmd_queue.put(("speaking", speaking))
 
     def set_status(self, text):
-        if self.root:
-            self.root.after(0, lambda: self.status_label.config(text=text))
+        self.ui_cmd_queue.put(("status", text))
 
     # ---- 外部调用：获取滑杆发出的舵机指令 ----
     def get_servo_cmd(self):
@@ -186,11 +184,10 @@ class FaceDisplay:
         except queue.Empty:
             return None
 
-    # ---- 外部调用：复位所有滑杆到中心值 ----
+    # ---- 外部调用：复位所有滑杆到中心值（线程安全，通过队列）----
     def reset_sliders(self):
         """复位所有滑杆到中心值"""
-        if self.root:
-            self.root.after(0, self._on_sliders_reset)
+        self.ui_cmd_queue.put(("reset_sliders", None))
 
     # ==============================
     # 内部 tkinter 实现
@@ -201,6 +198,7 @@ class FaceDisplay:
         self.root.title("Robot Face - 模拟显示")
         self.root.resizable(False, False)
         self.root.configure(bg="#2c2c2c")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_exit)  # X按钮走正常退出流程
 
         # --- 面部画布 ---
         self.canvas = tk.Canvas(
@@ -397,6 +395,24 @@ class FaceDisplay:
         except queue.Empty:
             pass
 
+        # 处理跨线程 UI 命令（只在主线程执行，线程安全）
+        try:
+            while True:
+                cmd, data = self.ui_cmd_queue.get_nowait()
+                if cmd == "status":
+                    self.status_label.config(text=data)
+                elif cmd == "speaking":
+                    self._speaking = data
+                    self._update_ui_state()
+                elif cmd == "reset_sliders":
+                    self._on_sliders_reset()
+                elif cmd == "stop":
+                    self._running = False
+                    self.root.destroy()
+                    return  # 直接返回，不再调度下一次
+        except queue.Empty:
+            pass
+
         if self._running:
             self._redraw_all()
             self.root.after(16, self._poll_queue)
@@ -535,8 +551,11 @@ class FaceDisplay:
         smile_l = s["smile_l"]
         lip = s["lip_up"]
 
-        mouth_w = MOUTH_HALF_W + (smile_r - 0.5) * 28 + (smile_l - 0.5) * 28
-        mouth_w = max(28, min(90, mouth_w))
+        # 左右半宽独立计算，各只受同侧微笑影响
+        half_w_l = MOUTH_HALF_W + (smile_l - 0.5) * 28
+        half_w_r = MOUTH_HALF_W + (smile_r - 0.5) * 28
+        half_w_l = max(14, min(60, half_w_l))
+        half_w_r = max(14, min(60, half_w_r))
 
         corner_lift_r = (smile_r - 0.5) * 22
         corner_lift_l = (smile_l - 0.5) * 22
@@ -545,24 +564,30 @@ class FaceDisplay:
 
         top_lip_offset = (lip - 0.5) * 14
 
-        left_x = MOUTH_CX - mouth_w
-        right_x = MOUTH_CX + mouth_w
+        # 上唇角落 X 使用固定半宽，不受微笑影响
+        top_left_x = MOUTH_CX - MOUTH_HALF_W
+        top_right_x = MOUTH_CX + MOUTH_HALF_W
 
-        top_ly = MOUTH_CY - mouth_open_h * 0.2 + top_lip_offset + corner_lift_l
-        top_cy = MOUTH_CY - mouth_open_h * 0.3 + top_lip_offset
-        top_ry = MOUTH_CY - mouth_open_h * 0.2 + top_lip_offset + corner_lift_r
+        # 下唇角落 X 随同侧微笑独立伸缩
+        bot_left_x = MOUTH_CX - half_w_l
+        bot_right_x = MOUTH_CX + half_w_r
+
+        # 上唇只受 lip_up 控制，不随下巴(jaw)和微笑(smile)移动
+        top_ly = MOUTH_CY - MOUTH_HALF_H * 0.2 + top_lip_offset
+        top_cy = MOUTH_CY - MOUTH_HALF_H * 0.3 + top_lip_offset
+        top_ry = MOUTH_CY - MOUTH_HALF_H * 0.2 + top_lip_offset
 
         bot_ly = MOUTH_CY + mouth_open_h + corner_lift_l
         bot_cy = MOUTH_CY + mouth_open_h * 1.2
         bot_ry = MOUTH_CY + mouth_open_h + corner_lift_r
 
         pts = [
-            left_x, top_ly,
+            top_left_x, top_ly,
             MOUTH_CX, top_cy,
-            right_x, top_ry,
-            right_x, bot_ry,
+            top_right_x, top_ry,
+            bot_right_x, bot_ry,
             MOUTH_CX, bot_cy,
-            left_x, bot_ly,
+            bot_left_x, bot_ly,
         ]
 
         c.coords(self._ids["mouth"], *pts)

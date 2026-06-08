@@ -233,25 +233,9 @@ def synthesize_to_wav(text, output_wav):
 # ==========================
 
 def main():
-    # ---- 启动 GUI ----
+    # ---- 启动 GUI（必须在主线程）----
     face_display = FaceDisplay()
-    face_display.start_in_thread()
-
-    # 等 tkinter 窗口就绪
-    time.sleep(0.3)
-
-    # ---- 连接舵机 ----
-    ctrl = ServoController()
-    connected = ctrl.connect()
-
-    if not connected:
-        print("[!] 舵机未连接，仅运行模拟显示模式")
-        face_display.set_status("模拟模式 - 无硬件连接")
-
-    servo_engine = ServoEngine(
-        ctrl if connected else None,
-        face_display
-    )
+    face_display._running = True
 
     # ---- 停止事件 ----
     stop_event = threading.Event()
@@ -259,98 +243,128 @@ def main():
     # 首次说话后启动后台线程
     bg_started = False
 
-    # ---- 主循环: 等待 GUI 输入 ----
-    speak_thread = None   # 当前播放线程引用
+    # ---- 后台逻辑循环（在子线程中运行）----
+    speak_thread = None  # 当前播放线程引用
+    ctrl = None
+    connected = False
 
-    while True:
-        cmd = face_display.get_text_input(timeout=0.05)
+    def _logic_loop():
+        nonlocal bg_started, speak_thread, ctrl, connected
 
-        # 处理滑杆发出的舵机指令
+        # 等 tkinter 就绪后再连接舵机（避免 hidapi 与 tkinter 初始化冲突）
+        while face_display.root is None:
+            time.sleep(0.01)
+        time.sleep(0.3)
+
+        ctrl_obj = ServoController()
+        connected = ctrl_obj.connect()
+        ctrl = ctrl_obj if connected else None
+
+        if not connected:
+            print("[!] 舵机未连接，仅运行模拟显示模式")
+            face_display.set_status("模拟模式 - 无硬件连接")
+
+        servo_engine = ServoEngine(
+            ctrl if connected else None,
+            face_display
+        )
+
         while True:
-            servo_cmd = face_display.get_servo_cmd()
-            if servo_cmd is None:
+            cmd = face_display.get_text_input(timeout=0.05)
+
+            # 处理滑杆发出的舵机指令
+            while True:
+                servo_cmd = face_display.get_servo_cmd()
+                if servo_cmd is None:
+                    break
+                sid, pwm = servo_cmd
+                if ctrl and connected:
+                    ctrl.send_pwm(sid, pwm, 50)
+
+            # 检查播放是否已结束
+            if speak_thread is not None and not speak_thread.is_alive():
+                speak_thread = None
+                stop_event.clear()
+                face_display.set_speaking(False)
+
+                # 说话结束，复位嘴巴到闭合状态 (S3: 1450=闭合)
+                mouth_closed = {3: 1450, 4: 1500, 5: 1500, 6: 1500}
+                servo_engine.apply_pose(mouth_closed)
+
+                # 同步复位 GUI 滑杆
+                face_display.reset_sliders()
+
+            if cmd is None:
+                continue
+
+            # -- 退出 --
+            if cmd == "__exit__":
+                stop_event.set()
+                if speak_thread and speak_thread.is_alive():
+                    speak_thread.join(timeout=3)
+                # 通过队列通知主线程销毁 tkinter（线程安全）
+                face_display.stop()
                 break
-            sid, pwm = servo_cmd
-            if ctrl and connected:
-                ctrl.send_pwm(sid, pwm, 50)
 
-        # 检查播放是否已结束
-        if speak_thread is not None and not speak_thread.is_alive():
-            speak_thread = None
-            stop_event.clear()
-            face_display.set_speaking(False)
-            
-            # 说话结束，复位嘴巴到闭合状态 (S3: 1450=闭合)
-            mouth_closed = {3: 1450, 4: 1500, 5: 1500, 6: 1500}
-            servo_engine.apply_pose(mouth_closed)
-            
-            # 同步复位 GUI 滑杆
-            face_display.reset_sliders()
+            # -- 停止 --
+            if cmd == "__stop__":
+                stop_event.set()
+                if speak_thread and speak_thread.is_alive():
+                    speak_thread.join(timeout=2)
+                speak_thread = None
+                stop_event.clear()
+                face_display.set_speaking(False)
 
-        if cmd is None:
-            continue
+                # 停止时也复位嘴巴到闭合状态
+                mouth_closed = {3: 1450, 4: 1500, 5: 1500, 6: 1500}
+                servo_engine.apply_pose(mouth_closed)
+                face_display.reset_sliders()
+                continue
 
-        # -- 退出 --
-        if cmd == "__exit__":
-            stop_event.set()
+            # -- 说话（如果正在播放，忽略新输入）--
+            text = cmd
             if speak_thread and speak_thread.is_alive():
-                speak_thread.join(timeout=3)
-            break
+                face_display.set_status("正在播放中，请先停止")
+                continue
 
-        # -- 停止 --
-        if cmd == "__stop__":
-            stop_event.set()
-            if speak_thread and speak_thread.is_alive():
-                speak_thread.join(timeout=2)
-            speak_thread = None
+            if not text:
+                continue
+
+            # 首次说话时启动后台线程
+            if connected and not bg_started:
+                # BlinkThread(ctrl, face_display).start()   # 眨眼 - 已暂停
+                # NeckThread(ctrl, face_display).start()
+                bg_started = True
+
             stop_event.clear()
-            face_display.set_speaking(False)
-            
-            # 停止时也复位嘴巴到闭合状态
-            mouth_closed = {3: 1450, 4: 1500, 5: 1500, 6: 1500}
-            servo_engine.apply_pose(mouth_closed)
-            face_display.reset_sliders()
-            continue
+            face_display.set_speaking(True)
 
-        # -- 说话（如果正在播放，忽略新输入）--
-        text = cmd
-        if speak_thread and speak_thread.is_alive():
-            face_display.set_status("正在播放中，请先停止")
-            continue
+            # TTS 合成 + 播放 (在工作线程，以便停止按钮生效)
+            def _speak(t):
+                try:
+                    visemes = text_to_visemes(t)
+                    print(f"Viseme: {visemes}")
+                    wav_file = "tts.wav"
+                    synthesize_to_wav(t, wav_file)
+                    play_wav_with_servo(wav_file, visemes, servo_engine, stop_event)
+                except Exception as e:
+                    print(f"[播放错误] {e}")
+                    face_display.set_status(f"播放出错: {e}")
 
-        if not text:
-            continue
+            speak_thread = threading.Thread(target=_speak, args=(text,), daemon=True)
+            speak_thread.start()
 
-        # 首次说话时启动后台线程
-        if connected and not bg_started:
-            # BlinkThread(ctrl, face_display).start()   # 眨眼 - 已暂停
-            # NeckThread(ctrl, face_display).start()
-            bg_started = True
+    # 在后台线程运行逻辑循环（含舵机连接），主线程留给 tkinter
+    logic_thread = threading.Thread(target=_logic_loop, daemon=True)
+    logic_thread.start()
 
-        stop_event.clear()
-        face_display.set_speaking(True)
-
-        # TTS 合成 + 播放 (在工作线程，以便停止按钮生效)
-        def _speak(t):
-            try:
-                visemes = text_to_visemes(t)
-                print(f"Viseme: {visemes}")
-                wav_file = "tts.wav"
-                synthesize_to_wav(t, wav_file)
-                play_wav_with_servo(wav_file, visemes, servo_engine, stop_event)
-            except Exception as e:
-                print(f"[播放错误] {e}")
-                face_display.set_status(f"播放出错: {e}")
-
-        speak_thread = threading.Thread(target=_speak, args=(text,), daemon=True)
-        speak_thread.start()
-        # 不 join，主循环继续响应 GUI 事件
+    # ---- 主线程运行 tkinter（阻塞直到窗口关闭）----
+    face_display._tk_main()
 
     # ---- 清理 ----
     if ctrl and connected:
         ctrl.close()
 
-    face_display.stop()
     print("程序已退出。")
 
 
