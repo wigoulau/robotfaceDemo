@@ -7,11 +7,19 @@ import numpy as np
 import sounddevice as sd
 
 from pypinyin import lazy_pinyin
-
 from piper.voice import PiperVoice
-voice = PiperVoice.load(
-    "models/tts/zh_CN-huayan-medium.onnx"
-)
+
+# 延迟加载模型（在后台线程中）
+voice = None
+voice_ready = threading.Event()
+
+def _load_voice_async():
+    global voice
+    try:
+        voice = PiperVoice.load("models/tts/zh_CN-huayan-medium.onnx")
+        voice_ready.set()
+    except Exception as e:
+        print(f"[ERR] 模型加载失败: {e}")
 
 # ==========================
 # 导入舵机控制器 + 面部显示
@@ -19,6 +27,12 @@ voice = PiperVoice.load(
 
 from servo_controller import ServoController
 from face_display import FaceDisplay
+from servo_interpolator import ServoInterpolator
+print("2")
+
+# 命令行参数: python demo.py [lerp|spring]
+INTERP_MODE = sys.argv[1] if len(sys.argv) > 1 else "lerp"
+print(f"[插值器模式] {INTERP_MODE}")
 
 
 # ==========================
@@ -86,17 +100,24 @@ def calc_rms(chunk):
 
 class ServoEngine:
 
-    def __init__(self, ctrl, face_display=None):
+    def __init__(self, ctrl, face_display=None, interpolator=None):
         self.ctrl = ctrl
         self.face = face_display
+        self.interpolator = interpolator  # 插值器（与 face_display 共享同一个实例）
 
-    def apply_pose(self, pose):
+    def apply_pose(self, pose, preset="mouth"):
+        """应用姿势：硬件舵机直接发送，面部显示走插值器"""
         if self.ctrl:
             for sid, pwm in pose.items():
+                # 硬件舵机自带速度控制 (send_pwm 第3个参数为速度)
                 self.ctrl.send_pwm(sid, int(pwm), 50)
 
         if self.face:
-            self.face.update_pose(pose)
+            if self.interpolator:
+                # 面部显示通过插值器平滑过渡
+                self.face.set_pose_target(pose, preset=preset)
+            else:
+                self.face.update_pose(pose)
 
 
 # ==========================
@@ -224,6 +245,10 @@ def play_wav_with_servo(wav_file, visemes, servo_engine, stop_event):
 # ==========================
 
 def synthesize_to_wav(text, output_wav):
+    # 等待模型加载完成
+    if not voice_ready.wait(timeout=30):
+        print("[ERR] 语音模型加载超时")
+        return
     with wave.open(output_wav, "wb") as wav_file:
         voice.synthesize_wav(text, wav_file)
 
@@ -233,18 +258,26 @@ def synthesize_to_wav(text, output_wav):
 # ==========================
 
 def main():
+    # ---- 后台加载语音模型 ----
+    threading.Thread(target=_load_voice_async, daemon=True).start()
+    
     # ---- 启动 GUI（必须在主线程）----
     face_display = FaceDisplay()
-    face_display._running = True
+    face_display.start_in_thread()
+    
+    # 等 tkinter 就绪
+    while face_display.root is None:
+        time.sleep(0.01)
+    time.sleep(0.2)
+    
+    # ---- 创建插值器 ----
+    interpolator = ServoInterpolator(mode=INTERP_MODE)
+    face_display.interpolator = interpolator
 
-    # ---- 停止事件 ----
+    # ---- 后台逻辑循环 ----
     stop_event = threading.Event()
-
-    # 首次说话后启动后台线程
     bg_started = False
-
-    # ---- 后台逻辑循环（在子线程中运行）----
-    speak_thread = None  # 当前播放线程引用
+    speak_thread = None
     ctrl = None
     connected = False
 
@@ -266,7 +299,8 @@ def main():
 
         servo_engine = ServoEngine(
             ctrl if connected else None,
-            face_display
+            face_display,
+            interpolator
         )
 
         while True:
@@ -289,7 +323,7 @@ def main():
 
                 # 说话结束，复位嘴巴到闭合状态 (S3: 1450=闭合)
                 mouth_closed = {3: 1450, 4: 1500, 5: 1500, 6: 1500}
-                servo_engine.apply_pose(mouth_closed)
+                servo_engine.apply_pose(mouth_closed, preset="reset")
 
                 # 同步复位 GUI 滑杆
                 face_display.reset_sliders()
@@ -317,7 +351,7 @@ def main():
 
                 # 停止时也复位嘴巴到闭合状态
                 mouth_closed = {3: 1450, 4: 1500, 5: 1500, 6: 1500}
-                servo_engine.apply_pose(mouth_closed)
+                servo_engine.apply_pose(mouth_closed, preset="reset")
                 face_display.reset_sliders()
                 continue
 
