@@ -2,6 +2,7 @@ import time
 import threading
 import queue
 import wave
+import sys
 
 import numpy as np
 import sounddevice as sd
@@ -28,7 +29,6 @@ def _load_voice_async():
 from servo_controller import ServoController
 from face_display import FaceDisplay
 from servo_interpolator import ServoInterpolator
-print("2")
 
 # 命令行参数: python demo.py [lerp|spring]
 INTERP_MODE = sys.argv[1] if len(sys.argv) > 1 else "lerp"
