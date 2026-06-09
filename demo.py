@@ -3,6 +3,7 @@ import threading
 import queue
 import wave
 import sys
+import random
 
 # numpy, sounddevice, pypinyin 延迟到实际需要时再导入
 
@@ -101,18 +102,50 @@ def calc_rms(chunk):
 
 class ServoEngine:
 
+    # 硬件 tick 间隔：25ms ≈ 40fps，足够平滑且不过载 HID
+    HW_TICK_INTERVAL = 0.025
+
     def __init__(self, ctrl, face_display=None, interpolator=None):
         self.ctrl = ctrl
         self.face = face_display
         self.interpolator = interpolator  # 插值器（与 face_display 共享同一个实例）
 
+        # 硬件舵机独立平滑插值器（软件端缓动，避免大幅跳变抖动）
+        self._hw_interp = ServoInterpolator(mode="lerp", tick_interval=self.HW_TICK_INTERVAL)
+        self._tick_stop = threading.Event()
+        self._tick_thread = None
+
+        if self.ctrl:
+            self._start_hw_tick()
+
+    def _start_hw_tick(self):
+        """启动硬件舵机平滑驱动线程"""
+        self._tick_stop.clear()
+        self._tick_thread = threading.Thread(target=self._hw_tick_loop, daemon=True)
+        self._tick_thread.start()
+
+    def _hw_tick_loop(self):
+        """以固定频率驱动硬件舵机插值，每次只发送增量小步长"""
+        while not self._tick_stop.is_set():
+            updates = self._hw_interp.tick()
+            if self.ctrl and updates:
+                for sid, pwm in updates.items():
+                    # duration 设为 tick 间隔(ms)，MCU 端刚好接住每一小步
+                    self.ctrl.send_pwm(sid, int(pwm))
+            time.sleep(self.HW_TICK_INTERVAL)
+
+    def set_slider_target(self, sid, pwm):
+        """滑杆控制目标（平滑插值，无突变）"""
+        if self.ctrl:
+            self._hw_interp.set_target(sid, pwm, preset="slider")
+
     def apply_pose(self, pose, preset="mouth"):
-        """应用姿势：硬件舵机直接发送，面部显示走插值器"""
+        """应用姿势：硬件舵机走软件插值器平滑，面部显示走插值器"""
         if self.ctrl:
             for sid, pwm in pose.items():
-                # 硬件舵机自带速度控制 (send_pwm 第3个参数为速度)
                 if sid in (3, 0):
-                    self.ctrl.send_pwm(sid, int(pwm), 50)
+                    # 设置插值目标，由 tick 线程平滑驱动
+                    self._hw_interp.set_target(sid, pwm, preset=preset)
 
         if self.face:
             if self.interpolator:
@@ -128,32 +161,82 @@ class ServoEngine:
 
 class BlinkThread(threading.Thread):
 
+    TICK_INTERVAL = 0.016  # 16ms ≈ 60fps
+
+    # 眼球活动偏移量（相对中心 1500，单位 PWM）
+    EYE_LR_RANGE = 150   # 左右偏移上限（±150）
+    EYE_UD_RANGE = 80    # 上下偏移上限
+
     def __init__(self, ctrl, face_display=None):
         super().__init__(daemon=True)
         self.ctrl = ctrl
         self.face = face_display
+        # 独立插值器，管理所有眼睛相关舵机
+        self._interp = ServoInterpolator(mode="lerp", tick_interval=self.TICK_INTERVAL)
+        # 初始化：眼睑睁开、眼球居中
+        init_state = {
+            8: 2000, 11: 2000,   # 眼睑（右/左），睁开
+            9: 1500, 12: 1500,   # 眼球左右（右/左），居中
+            7: 1500, 10: 1500,   # 眼球上下（右/左），居中
+        }
+        for sid, val in init_state.items():
+            self._interp.set_instant(sid, val)
+
+    def _move_to(self, targets, speed, timeout=0.4):
+        """平滑驱动指定舵机到目标位置，等待全部到位或超时"""
+        for sid, pwm in targets.items():
+            self._interp.set_target(sid, pwm, speed=speed, preset="blink")
+            if self.face:
+                self.face.set_target(sid, pwm, preset="blink")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            updates = self._interp.tick()
+            if not updates:
+                break  # 所有舵机已到位
+            if self.ctrl:
+                for sid, pwm in updates.items():
+                    self.ctrl.send_pwm(sid, int(pwm))
+            time.sleep(self.TICK_INTERVAL)
+
+    def _blink(self):
+        """左右眼同步眨眼：快速闭合，缓慢睁开"""
+        print("Blink")
+        self._move_to({8: 2000, 11: 1100}, speed=25, timeout=0.25)  # 快速闭眼
+        time.sleep(0.05 + random.uniform(0, 0.04))                   # 轻微随机保持
+        print("Open")
+        self._move_to({8: 1300, 11: 1800}, speed=15, timeout=0.4)   # 缓慢睁开
+
+    def _saccade(self):
+        """眼球随机凝视转动（左右眼完全同步）"""
+        lr = random.randint(-self.EYE_LR_RANGE, self.EYE_LR_RANGE)
+        ud = random.randint(-self.EYE_UD_RANGE, self.EYE_UD_RANGE)
+        targets = {
+            9:  1500 + lr,   # 右眼 LR
+            12: 1500 + lr,   # 左眼 LR（同向同步）
+            7:  1500 + ud,   # 右眼 UD
+            10: 1500 + ud,   # 左眼 UD（同向同步）
+        }
+        # 眼球 saccade 较快，到位后保持凝视 0.5~2 秒
+        self._move_to(targets, speed=22, timeout=0.3)
+        time.sleep(random.uniform(0.5, 2.0))
 
     def run(self):
+        # 用绝对时间戳调度，避免被阻塞操作累积延迟
+        next_blink   = time.time() + random.uniform(2, 4)
+        next_saccade = time.time() + random.uniform(2, 5)
+
         while True:
-            time.sleep(np.random.uniform(2, 5))
+            now = time.time()
 
-            # 闭眼
-            if self.ctrl:
-                self.ctrl.send_pwm(8, 1000, 80)
-                self.ctrl.send_pwm(11, 1000, 80)
-            if self.face:
-                self.face.update_servo(8, 1000)
-                self.face.update_servo(11, 1000)
+            if now >= next_blink:
+                self._blink()
+                next_blink = time.time() + random.uniform(2, 5)
 
-            time.sleep(0.08)
+            if time.time() >= next_saccade:
+                self._saccade()
+                next_saccade = time.time() + random.uniform(3, 7)
 
-            # 睁眼
-            if self.ctrl:
-                self.ctrl.send_pwm(8, 1800, 80)
-                self.ctrl.send_pwm(11, 1800, 80)
-            if self.face:
-                self.face.update_servo(8, 1800)
-                self.face.update_servo(11, 1800)
+            time.sleep(0.05)  # 50ms 主循环轮询
 
 
 # ==========================
@@ -173,7 +256,7 @@ class NeckThread(threading.Thread):
             pwm = int(1500 + np.sin(t) * 80)
 
             if self.ctrl:
-                self.ctrl.send_pwm(2, pwm, 50)
+                self.ctrl.send_pwm(2, pwm)
             if self.face:
                 self.face.update_servo(2, pwm)
 
@@ -335,14 +418,14 @@ def main():
         while True:
             cmd = face_display.get_text_input(timeout=0.05)
 
-            # 处理滑杆发出的舵机指令
+            # 处理滑杆发出的舵机指令（走插值器，防止突变抖动）
             while True:
                 servo_cmd = face_display.get_servo_cmd()
                 if servo_cmd is None:
                     break
                 sid, pwm = servo_cmd
                 if ctrl and connected:
-                    ctrl.send_pwm(sid, pwm, 50)
+                    servo_engine.set_slider_target(sid, pwm)
 
             # 检查播放是否已结束
             if speak_thread is not None and not speak_thread.is_alive():
@@ -351,6 +434,7 @@ def main():
                 face_display.set_speaking(False)
 
                 # 说话结束，复位嘴巴到闭合状态 (S3: 1450=闭合)
+                print("说话结束，复位嘴巴")
                 mouth_closed = {3: 1450, 4: 1500, 5: 1500, 6: 1500}
                 servo_engine.apply_pose(mouth_closed, preset="reset")
 
@@ -398,7 +482,7 @@ def main():
 
             # 首次说话时启动后台线程
             if connected and not bg_started:
-                # BlinkThread(ctrl, face_display).start()   # 眨眼 - 已暂停
+                BlinkThread(ctrl, face_display).start()   # 眨眼 - 已暂停
                 # NeckThread(ctrl, face_display).start()
                 bg_started = True
 

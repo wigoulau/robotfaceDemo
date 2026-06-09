@@ -24,6 +24,16 @@ class ServoInterpolator:
         "reset": 5,       # 复位：平滑回归
     }
 
+    # 每 tick 最大步长限制（PWM单位），防止目标切换时速度尖峰
+    # 以 25ms tick 为基准：30 PWM/tick ≈ 1200 PWM/s，250单位行程约 200ms
+    MAX_STEP_PRESETS = {
+        "mouth": 30,       # 嘴型：限制速度尖峰，开口/闭口均匀
+        "expression": 15,  # 表情：更柔和
+        "blink": 9999,     # 眨眼：不限制，需快速
+        "slider": 9999,    # 滑杆：即时反馈，不限制
+        "reset": 20,       # 复位：温和收口
+    }
+
     # 弹簧模式默认参数
     SPRING_STIFFNESS = 250.0   # 刚度：越高越快到位
     SPRING_DAMPING = 18.0      # 阻尼：越高越少回弹
@@ -41,6 +51,7 @@ class ServoInterpolator:
         self._current = {}    # servo_id → 当前PWM (float)
         self._target = {}     # servo_id → 目标PWM (int)
         self._speed = {}      # servo_id → lerp 速度 (每秒进度倍数)
+        self._max_step = {}   # servo_id → 每tick最大步长 (PWM)
         self._velocity = {}   # servo_id → spring 速度 (PWM/秒)
 
     # ---- 公共接口 ----
@@ -56,6 +67,7 @@ class ServoInterpolator:
 
         self._target[servo_id] = int(pwm)
         self._speed[servo_id] = speed
+        self._max_step[servo_id] = self.MAX_STEP_PRESETS.get(preset, 9999)
 
         # 首次设置时直接到位（避免初始跳变）
         if servo_id not in self._current:
@@ -104,11 +116,15 @@ class ServoInterpolator:
     # ---- 内部实现 ----
 
     def _tick_lerp(self, sid, cur, diff):
-        """指数衰减插值：每 tick 向目标靠近 speed*dt 比例"""
+        """指数衰减插值：每 tick 向目标靠近 speed*dt 比例，并限制最大步长"""
         speed = self._speed.get(sid, 10)
         # 指数衰减系数：speed=10 时约 170ms 到位，speed=5 时约 350ms
         factor = min(1.0, speed * self.dt)
-        return cur + diff * factor
+        step = diff * factor
+        # 限制每tick最大步长，防止目标切换时出现速度尖峰
+        max_step = self._max_step.get(sid, 9999)
+        step = max(-max_step, min(max_step, step))
+        return cur + step
 
     def _tick_spring(self, sid, cur, diff):
         """

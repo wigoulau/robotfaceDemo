@@ -90,12 +90,12 @@ class ServoController:
             self.device = None
             return False
 
-    def send_pwm(self, servo_id, pwm, duration=1000):
+    def send_pwm(self, servo_id, pwm):
         """
-        发送一条舵机 PWM 控制指令
+        发送一条舵机 PWM 控制指令。
+        移动速度由调用方通过步长+sleep控制，duration 固定 1000。
         :param servo_id: 舵机通道号 (如 4, 6)
         :param pwm: PWM 值 (如 1500)
-        :param duration: 时间参数 (默认 1000)
         :return: True/False
         """
         if not self.device:
@@ -110,8 +110,8 @@ class ServoController:
         for i in range(len(prefix)):
             buf[i] = prefix[i]
 
-        # 3. 生成 ASCII 指令: #xxxPxxxxTxxxx!
-        cmd_str = f"#{servo_id:03d}P{pwm}T{duration:04d}!"
+        # 3. 生成 ASCII 指令: #xxxPxxxxT1000!
+        cmd_str = f"#{servo_id:03d}P{pwm}T1000!"
         cmd_bytes = cmd_str.encode('ascii')
 
         # 4. 填入缓冲区 (从第 8 字节开始)
@@ -123,7 +123,7 @@ class ServoController:
         try:
             result = self.device.write(buf)
             if result and result > 0:
-                if (servo_id == 3):
+                if (servo_id in [11]):
                     logger.info(f"S{servo_id} PWM={pwm} ({cmd_str})")
                 return True
             else:
