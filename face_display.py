@@ -12,24 +12,33 @@ import tkinter as tk
 import math
 
 from servo_interpolator import ServoInterpolator
+from logger import get_logger
+from servo_constants import (
+    S2_NECK, S3_JAW, S4_SMILE_R, S5_SMILE_L, S6_LIP_UP,
+    S7_EYE_UD_R, S8_BLINK_R, S9_EYE_LR_R,
+    S10_EYE_UD_L, S11_BLINK_L, S12_EYE_LR_L,
+    S13_BROW, S14_TONGUE,
+)
+
+log = get_logger(__name__)
 
 # ==========================
 # 舵机ID → 视觉参数映射
 # ==========================
 SERVO_RANGE = {
-    2:  {"name": "neck",     "min": 1000, "center": 1500, "max": 2000},
-    3:  {"name": "jaw",      "min": 1000, "center": 1450, "max": 1450},
-    4:  {"name": "smile_r",  "min": 1200, "center": 1500, "max": 1900},
-    5:  {"name": "smile_l",  "min": 1200, "center": 1500, "max": 1900},
-    6:  {"name": "lip_up",   "min": 1200, "center": 1500, "max": 1900},
-    7:  {"name": "eye_up_r", "min": 1200, "center": 1500, "max": 1800},
-    8:  {"name": "blink_r",  "min": 1000, "center": 1800, "max": 2000},
-    9:  {"name": "eye_lr_r", "min": 1200, "center": 1500, "max": 1800},
-    10: {"name": "eye_up_l", "min": 1200, "center": 1500, "max": 1800},
-    11: {"name": "blink_l",  "min": 1000, "center": 1800, "max": 2000},
-    12: {"name": "eye_lr_l", "min": 1200, "center": 1500, "max": 1800},
-    13: {"name": "brow",     "min": 1200, "center": 1500, "max": 1900},
-    14: {"name": "tongue",   "min": 1200, "center": 1500, "max": 1900},
+    S2_NECK:      {"name": "neck",     "min": 1000, "center": 1500, "max": 2000},
+    S3_JAW:       {"name": "jaw",      "min": 1000, "center": 1450, "max": 1450},
+    S4_SMILE_R:   {"name": "smile_r",  "min": 1200, "center": 1500, "max": 1900},
+    S5_SMILE_L:   {"name": "smile_l",  "min": 1200, "center": 1500, "max": 1900},
+    S6_LIP_UP:    {"name": "lip_up",   "min": 1200, "center": 1500, "max": 1900},
+    S7_EYE_UD_R:  {"name": "eye_up_r", "min": 1200, "center": 1500, "max": 1800},
+    S8_BLINK_R:   {"name": "blink_r",  "min": 1000, "center": 1800, "max": 2000},
+    S9_EYE_LR_R:  {"name": "eye_lr_r", "min": 1200, "center": 1500, "max": 1800},
+    S10_EYE_UD_L: {"name": "eye_up_l", "min": 1200, "center": 1500, "max": 1800},
+    S11_BLINK_L:  {"name": "blink_l",  "min": 1000, "center": 1800, "max": 2000},
+    S12_EYE_LR_L: {"name": "eye_lr_l", "min": 1200, "center": 1500, "max": 1800},
+    S13_BROW:     {"name": "brow",     "min": 1200, "center": 1500, "max": 1900},
+    S14_TONGUE:   {"name": "tongue",   "min": 1200, "center": 1500, "max": 1900},
 }
 
 
@@ -249,10 +258,10 @@ class FaceDisplay:
 
         # 4 个嘴巴舵机的滑杆
         mouth_servos = [
-            (3,  "下巴",     1000, 1450, 1450),  # 默认闭合
-            (4,  "右微笑",   1200, 1900, 1500),
-            (5,  "左微笑",   1200, 1900, 1500),
-            (6,  "上唇",     1200, 1900, 1500),
+            (S3_JAW,     "下巴",     1000, 1450, 1450),  # 默认闭合
+            (S4_SMILE_R, "右微笑",   1200, 1900, 1500),
+            (S5_SMILE_L, "左微笑",   1200, 1900, 1500),
+            (S6_LIP_UP,  "上唇",     1200, 1900, 1500),
         ]
 
         slider_grid = tk.Frame(slider_frame, bg="#3a3a3a")
@@ -396,7 +405,7 @@ class FaceDisplay:
 
     def _on_sliders_reset(self):
         """复位所有滑杆到中心值"""
-        centers = {3: 1450, 4: 1500, 5: 1500, 6: 1500}
+        centers = {S3_JAW: 1450, S4_SMILE_R: 1500, S5_SMILE_L: 1500, S6_LIP_UP: 1500}
         for sid, center in centers.items():
             if sid in self._sliders:
                 self._sliders[sid].set(center)
@@ -666,20 +675,21 @@ class FaceDisplay:
 # 独立测试入口
 # ==========================
 if __name__ == "__main__":
+    log.info("面部模拟显示已启动。")
+    log.info("在 demo.py 中集成使用。")
+
     display = FaceDisplay()
     display.start_in_thread()
-
-    print("面部模拟显示已启动。")
-    print("在 demo.py 中集成使用。")
 
     while True:
         cmd = display.get_text_input(timeout=1)
         if cmd == "__exit__":
+            log.info("收到退出指令")
             display.stop()
             break
         elif cmd == "__stop__":
-            print("[停止]")
+            log.info("[停止]")
         elif cmd is not None:
-            print(f"[输入文本] {cmd}")
+            log.info("[输入文本] %s", cmd)
 
-    print("已退出。")
+    log.info("已退出。")

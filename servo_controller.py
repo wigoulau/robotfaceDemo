@@ -1,18 +1,10 @@
 import time
 import sys
-import logging
+from tracemalloc import take_snapshot
 import hid
 
-# 配置 logger（带时间戳）
-logger = logging.getLogger("servo")
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter(
-        "%(asctime)s.%(msecs)03d  %(message)s",
-        datefmt="%H:%M:%S"
-    ))
-    logger.addHandler(handler)
-    logger.setLevel(logging.DEBUG)
+from logger import get_logger
+log = get_logger(__name__)
 
 VENDOR_ID = 0x0483
 PRODUCT_ID = 0x5750
@@ -41,52 +33,55 @@ class ServoController:
             for d in devices:
                 path = d["path"].decode("utf-8", errors="ignore").lower()
                 if "col02" in path:
-                    print(f"     [Windows] 锁定 col02 供应商端点")
+                    log.info("    [Windows] 锁定 col02 供应商端点")
                     return d["path"]
 
         # 策略2: 全平台 - 按 usage_page=0xFFxx (厂商自定义范围) 匹配
         for d in devices:
             up = d.get("usage_page", 0)
             if (up & 0xFF00) == 0xFF00 and up != 0xFFFF:
-                print(f"     锁定 usage_page=0x{up:04X} 厂商自定义接口")
+                log.info("    锁定 usage_page=0x%04X 厂商自定义接口", up)
                 return d["path"]
 
         # 策略3: 按 interface_number=1 匹配 (STM32 供应商接口通常是接口1)
         for d in devices:
             if d.get("interface_number") == 1:
-                print(f"     锁定 interface_number=1")
+                log.info("    锁定 interface_number=1")
                 return d["path"]
 
         # 兜底: 最后一个接口
-        print(f"     未匹配到特定接口，使用最后一个")
+        log.info("    未匹配到特定接口，使用最后一个")
         return devices[-1]["path"]
 
+    def is_connected(self):
+        """设备是否已连接"""
+        return self.device is not None
+        
     def connect(self):
         """扫描设备并连接供应商端点"""
-        print(f"[..] 正在扫描 HID 设备 (平台: {sys.platform})...")
+        log.info("正在扫描 HID 设备 (平台: %s)...", sys.platform)
         devices = hid.enumerate(self.vid, self.pid)
 
         if not devices:
-            print(f"[ERR] 未发现 VID=0x{self.vid:04X} PID=0x{self.pid:04X} 的设备")
+            log.error("未发现 VID=0x%04X PID=0x%04X 的设备", self.vid, self.pid)
             return False
 
-        print(f"     发现 {len(devices)} 个逻辑接口:")
+        log.info("    发现 %d 个逻辑接口:", len(devices))
         for d in devices:
             path = d["path"].decode("utf-8", errors="ignore")
-            print(f"       path={path[:60]}")
-            print(f"       usage_page=0x{d.get('usage_page', 0):04X} "
-                  f"usage=0x{d.get('usage', 0):04X} "
-                  f"interface={d.get('interface_number', -1)}")
+            log.info("      path=%s", path[:60])
+            log.info("      usage_page=0x%04X usage=0x%04X interface=%s",
+                     d.get('usage_page', 0), d.get('usage', 0), d.get('interface_number', -1))
 
         self.device_path = self._select_interface(devices)
 
         try:
             self.device = hid.device()
             self.device.open_path(self.device_path)
-            print("[OK] 设备连接成功")
+            log.info("设备连接成功")
             return True
         except Exception as e:
-            print(f"[ERR] 连接失败: {e}")
+            log.error("连接失败: %s", e)
             self.device = None
             return False
 
@@ -99,7 +94,7 @@ class ServoController:
         :return: True/False
         """
         if not self.device:
-            logger.error("设备未连接")
+            log.error("设备未连接")
             return False
 
         # 1. 初始化 64 字节全零缓冲区
@@ -123,14 +118,61 @@ class ServoController:
         try:
             result = self.device.write(buf)
             if result and result > 0:
-                if (servo_id in [11]):
-                    logger.info(f"S{servo_id} PWM={pwm} ({cmd_str})")
+                if servo_id in [11]:
+                    log.debug("S%d PWM=%d (%s)", servo_id, pwm, cmd_str)
                 return True
             else:
-                logger.warning(f"S{servo_id} {cmd_str}  result={result}")
+                log.warning("S%d %s  result=%s", servo_id, cmd_str, result)
                 return False
         except Exception as e:
-            logger.error(f"S{servo_id} {cmd_str}  {e}")
+            log.error("S%d %s  %s", servo_id, cmd_str, e)
+            return False
+
+    def send_pwm_batch(self, poses):
+        """
+        批量发送一组舵机 PWM 指令（合并到单个 HID 事务）。
+        :param poses: dict, {servo_id: pwm}, 如 {6: 1500, 7: 1500, 8: 1500}
+        :return: True/False
+        """
+        if not self.device:
+            log.error("设备未连接")
+            return False
+
+        # 1. 生成所有 ASCII 指令并拼接
+        cmd_parts = []
+        for sid in sorted(poses.keys()):
+            pwm = poses[sid]
+            cmd_parts.append(f"#{sid:03d}P{pwm}T1000!")
+        cmd_str = "".join(cmd_parts)
+        cmd_bytes = cmd_str.encode('ascii')
+
+        # 2. 构建完整数据包: 8字节头 + 指令数据
+        #    头: 02 02 [len_lo] [len_hi] 00 00 00 01
+        data_len = len(cmd_bytes) + 12
+        packet = [0x02, 0x02,
+                  data_len & 0xFF, (data_len >> 8) & 0xFF,
+                  0x00, 0x01, 0xE7, 0x01, 0x7B]
+        packet.extend("G0000".encode('ascii'))
+        packet.extend(cmd_bytes)
+        packet.append(0x7D)
+
+        # 3. 按 64 字节分片发送，超过则续写
+        try:
+            offset = 0
+            while offset < len(packet):
+                chunk = packet[offset:offset + 64]
+                # 补齐到 64 字节
+                while len(chunk) < 64:
+                    chunk.append(0x00)
+                self.device.write(chunk)
+                offset += 64
+                if offset < len(packet):
+                    time.sleep(0.005)  # 续写间隔 5ms
+
+            log.debug("BATCH %s", cmd_str)
+            return True
+        except Exception as e:
+            log.error("BATCH %s  %s", cmd_str, e)
             return False
 
     def close(self):
@@ -138,12 +180,34 @@ class ServoController:
         if self.device:
             self.device.close()
             self.device = None
-            print("[OK] 设备已关闭")
+            log.info("设备已关闭")
 
 
 # ================= 主程序入口 =================
 if __name__ == "__main__":
     ctrl = ServoController()
+
+    def test_servo(t: float):
+        print(f"测试舵机 3 {t} 秒")
+        ctrl.send_pwm(9, 1300)
+        ctrl.send_pwm(3, 1300)
+        time.sleep(t)
+        # ctrl.send_pwm(3, 1200)
+        # time.sleep(1)
+        # ctrl.send_pwm(3, 1100)
+        # time.sleep(1)
+        # ctrl.send_pwm(3, 1100)
+        ctrl.send_pwm(3, 1000)
+        ctrl.send_pwm(9, 1600)
+        time.sleep(t)
+        ctrl.send_pwm(9, 1300)
+        ctrl.send_pwm(3, 1300)
+    
+    def test_servo_batch(t: float):
+        print(f"测试舵机 3 {t} 秒")
+        ctrl.send_pwm_batch({1: 1300, 2: 1300})
+        # time.sleep(t)
+        # ctrl.send_pwm_batch({3: 1000, 9: 1600})
 
     if ctrl.connect():
         try:
@@ -155,6 +219,9 @@ if __name__ == "__main__":
 
                 if raw.lower() == 'q':
                     break
+                elif raw.lower() == 't':
+                    test_servo(1)
+                    continue
 
                 parts = raw.split()
                 if len(parts) != 2:
@@ -162,6 +229,12 @@ if __name__ == "__main__":
                     continue
 
                 try:
+                    if parts[0] == 't':
+                        test_servo(float(parts[1]))
+                        continue
+                    elif parts[0] == 'b':
+                        test_servo_batch(float(parts[1]))
+                        continue
                     ch = int(parts[0])
                     pwm = int(parts[1])
                 except ValueError:
