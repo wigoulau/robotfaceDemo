@@ -128,46 +128,45 @@ class ServoController:
             log.error("S%d %s  %s", servo_id, cmd_str, e)
             return False
 
-    def send_pwm_batch(self, poses):
+    def send_pwm_batch(self, commands):
         """
         批量发送一组舵机 PWM 指令（合并到单个 HID 事务）。
-        :param poses: dict, {servo_id: pwm}, 如 {6: 1500, 7: 1500, 8: 1500}
+        指令用 {} 包裹: {#009P1600T0100!#012P1800T0100!}
+        :param commands: list of (servo_id, pwm, time_ms)
+            如 [(3, 1300, 500), (9, 1500, 1000)]
         :return: True/False
         """
         if not self.device:
             log.error("设备未连接")
             return False
 
-        # 1. 生成所有 ASCII 指令并拼接
+        # 1. 生成指令: {#XXXP{pwm}T{time}!#XXXP{pwm}T{time}!}
         cmd_parts = []
-        for sid in sorted(poses.keys()):
-            pwm = poses[sid]
-            cmd_parts.append(f"#{sid:03d}P{pwm}T1000!")
-        cmd_str = "".join(cmd_parts)
+        for sid, pwm, time_ms in commands:
+            cmd_parts.append(f"#{sid:03d}P{pwm}T{time_ms:04d}!")
+        cmd_str = "{" + "".join(cmd_parts) + "}"
         cmd_bytes = cmd_str.encode('ascii')
 
-        # 2. 构建完整数据包: 8字节头 + 指令数据
-        #    头: 02 02 [len_lo] [len_hi] 00 00 00 01
-        data_len = len(cmd_bytes) + 12
-        packet = [0x02, 0x02,
-                  data_len & 0xFF, (data_len >> 8) & 0xFF,
-                  0x00, 0x01, 0xE7, 0x01, 0x7B]
-        packet.extend("G0000".encode('ascii'))
+        # 2. 构建完整数据包:
+        #    02 02 [len*1] [00 00 00 00 01] [{...payload...}]
+        #    len = 5(fixed cmd) + len(cmd_bytes)
+        fixed_cmd = [0x00, 0x00, 0x00, 0x00, 0x01]
+        payload_len = len(fixed_cmd) + len(cmd_bytes)
+        packet = [0x02, 0x02, payload_len]
+        packet.extend(fixed_cmd)
         packet.extend(cmd_bytes)
-        packet.append(0x7D)
 
         # 3. 按 64 字节分片发送，超过则续写
         try:
             offset = 0
             while offset < len(packet):
                 chunk = packet[offset:offset + 64]
-                # 补齐到 64 字节
                 while len(chunk) < 64:
                     chunk.append(0x00)
                 self.device.write(chunk)
                 offset += 64
                 if offset < len(packet):
-                    time.sleep(0.005)  # 续写间隔 5ms
+                    time.sleep(0.005)
 
             log.debug("BATCH %s", cmd_str)
             return True
@@ -205,9 +204,10 @@ if __name__ == "__main__":
     
     def test_servo_batch(t: float):
         print(f"测试舵机 3 {t} 秒")
-        ctrl.send_pwm_batch({1: 1300, 2: 1300})
-        # time.sleep(t)
-        # ctrl.send_pwm_batch({3: 1000, 9: 1600})
+        ctrl.send_pwm_batch([(9, 1300, 1000), (12, 1300, 1000), (3, 1000, 1000)])
+        # ctrl.send_pwm_batch([(3, 1000, 1000)])
+        time.sleep(t)
+        ctrl.send_pwm_batch([(9, 1600, 100), (12, 1800, 100), (3, 1300, 600)])
 
     if ctrl.connect():
         try:
