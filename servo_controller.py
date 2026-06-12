@@ -132,8 +132,13 @@ class ServoController:
         """
         批量发送一组舵机 PWM 指令（合并到单个 HID 事务）。
         指令用 {} 包裹: {#009P1600T0100!#012P1800T0100!}
+        超过64字节自动分包，每包都有独立的 02 02 头。
+
+        每包结构 (64字节):
+          [02 02] [len_lo len_hi] [cmd×4] [data] [00 padding]
+          len = 4 + len(data)
+
         :param commands: list of (servo_id, pwm, time_ms)
-            如 [(3, 1300, 500), (9, 1500, 1000)]
         :return: True/False
         """
         if not self.device:
@@ -147,26 +152,33 @@ class ServoController:
         cmd_str = "{" + "".join(cmd_parts) + "}"
         cmd_bytes = cmd_str.encode('ascii')
 
-        # 2. 构建完整数据包:
-        #    02 02 [len*1] [00 00 00 00 01] [{...payload...}]
-        #    len = 5(fixed cmd) + len(cmd_bytes)
-        fixed_cmd = [0x00, 0x00, 0x00, 0x00, 0x01]
-        payload_len = len(fixed_cmd) + len(cmd_bytes)
-        packet = [0x02, 0x02, payload_len]
-        packet.extend(fixed_cmd)
-        packet.extend(cmd_bytes)
+        # 2. 分包发送: 每包64字节 = 8字节头 + 最多56字节数据
+        #    头: 02 02 [len×1] [cmd×5] [payload×len]
+        #    单包 cmd: 00 00 00 00 01
+        #    多包 cmd: 00 00 00 6b 01
+        max_data_per_pkt = 56  # 64 - 8(头)
+        needs_multi = len(cmd_bytes) > max_data_per_pkt
+        fixed_cmd = [0x00, 0x00, 0x00, 0x6b, 0x01] if needs_multi else [0x00, 0x00, 0x00, 0x00, 0x01]
 
-        # 3. 按 64 字节分片发送，超过则续写
         try:
             offset = 0
-            while offset < len(packet):
-                chunk = packet[offset:offset + 64]
-                while len(chunk) < 64:
-                    chunk.append(0x00)
-                self.device.write(chunk)
-                offset += 64
-                if offset < len(packet):
-                    time.sleep(0.005)
+            while offset < len(cmd_bytes):
+                chunk_data = list(cmd_bytes[offset:offset + max_data_per_pkt])
+                data_len = len(chunk_data) + len(fixed_cmd)
+
+                # 构建包头: 02 02 [lenx1] [cmd×5] [payloadxlen]
+                pkt = [0x02, 0x02, data_len & 0xFF]
+                pkt.extend(fixed_cmd)
+                pkt.extend(chunk_data)
+
+                # 补齐到 64 字节
+                while len(pkt) < 64:
+                    pkt.append(0x00)
+
+                self.device.write(pkt)
+                offset += max_data_per_pkt
+                if offset < len(cmd_bytes):
+                    time.sleep(0.005)  # 分包间隔 5ms
 
             log.debug("BATCH %s", cmd_str)
             return True
@@ -203,11 +215,27 @@ if __name__ == "__main__":
         ctrl.send_pwm(3, 1300)
     
     def test_servo_batch(t: float):
-        print(f"测试舵机 3 {t} 秒")
-        ctrl.send_pwm_batch([(9, 1300, 1000), (12, 1300, 1000), (3, 1000, 1000)])
-        # ctrl.send_pwm_batch([(3, 1000, 1000)])
+        # 测试1: 单包 (≤56字节) → cmd=00 00 00 00 01
+        print(f"[单包测试] 1个舵机")
+        ctrl.send_pwm_batch([(9, 1300, 1000)])
         time.sleep(t)
-        ctrl.send_pwm_batch([(9, 1600, 100), (12, 1800, 100), (3, 1300, 600)])
+    
+        # 测试2: 多包 (>56字节) → cmd=00 00 00 6b 01
+        print(f"[多包测试] 7个舵机 (114字节)")
+        ctrl.send_pwm_batch([
+            (3,  1000, 1000), (4,  1300, 1000), (7,  1300, 1000),
+            (8,  1300, 1000), (10,  1300, 1000), (9,  1600, 100),
+            (12, 1800, 100),
+        ])
+        time.sleep(t)
+    
+        # 复位
+        print("[复位]")
+        ctrl.send_pwm_batch([
+            (3,  1400, 500), (4,  1500, 500), (7,  1500, 500),
+            (8,  1500, 500), (10,  1500, 500), (9,  1300, 500),
+            (12, 1500, 500),
+        ])
 
     if ctrl.connect():
         try:
