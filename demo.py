@@ -15,9 +15,11 @@ voice = None
 voice_ready = threading.Event()
 
 def _load_voice_async():
+    """在后台线程加载TTS模型,避免阻塞GUI"""
     global voice
     try:
         from piper.voice import PiperVoice
+        log.info("开始加载TTS模型...")
         voice = PiperVoice.load("models/tts/zh_CN-huayan-medium.onnx")
         voice_ready.set()
         log.info("TTS 模型加载完成")
@@ -88,22 +90,22 @@ class BlinkThread(threading.Thread):
         super().__init__(daemon=True)
         self._jc = joint_ctrl
         # 初始化：眼睑睁开、眼球居中
-        self._jc.eyes_open(preset="blink")
+        self._jc.eyes_open()
 
     def _blink(self):
         """左右眼同步眨眼：快速闭合，缓慢睁开"""
-        log.debug("Blink")
-        self._jc.eyes_close(speed=25)
-        time.sleep(0.05 + random.uniform(0, 0.04))  # 轻微随机保持
-        log.debug("Open")
-        self._jc.eyes_open(preset="blink")
+        log.debug("Blink close")
+        close_wait = self._jc.eyes_close()          # 返回 tick延迟+duration 秒
+        time.sleep(close_wait + random.uniform(0, 0.01))  # 等闭合完成 + 极短随机保持(0-10ms)
+        log.debug("Blink open")
+        self._jc.eyes_open()
 
     def _saccade(self):
         """眼球随机凝视转动（左右眼完全同步）"""
         lr = random.randint(-self.EYE_LR_RANGE, self.EYE_LR_RANGE)
         ud = random.randint(-self.EYE_UD_RANGE, self.EYE_UD_RANGE)
-        self._jc.eye_saccade(lr, ud)
-        time.sleep(random.uniform(0.5, 2.0))
+        move_wait = self._jc.eye_saccade(lr, ud)    # 返回 tick延迟+duration 秒
+        time.sleep(move_wait + random.uniform(0.5, 2.0))  # 等到位 + 凝视保持
 
     def run(self):
         # 用绝对时间戳调度，避免被阻塞操作累积延迟
@@ -117,9 +119,9 @@ class BlinkThread(threading.Thread):
                 self._blink()
                 next_blink = time.time() + random.uniform(2, 5)
 
-            if time.time() >= next_saccade:
-                self._saccade()
-                next_saccade = time.time() + random.uniform(3, 7)
+            # if time.time() >= next_saccade:
+            #     self._saccade()
+            #     next_saccade = time.time() + random.uniform(3, 7)
 
             time.sleep(0.05)  # 50ms 主循环轮询
 
@@ -265,20 +267,37 @@ def main():
 
     # ---- 后台逻辑循环 ----
     stop_event = threading.Event()
-    bg_started = False
     speak_thread = None
     connected = False
 
     def _logic_loop():
-        nonlocal bg_started, speak_thread, connected
+        nonlocal speak_thread, connected
 
         # 等 tkinter 就绪后赋值插值器（不连接舵机，避免阻塞 GUI）
         while face_display.root is None:
             time.sleep(0.01)
         time.sleep(0.3)
         face_display.interpolator = interpolator
+        
         # 立即启动硬件 tick 线程（内部有连接检查，无硬件也安全）
         joint_ctrl.start()
+        
+        # 立即连接舵机并启动眨眼线程
+        try:
+            connected = servo_iface.connect()
+            if connected:
+                log.info("舵机连接成功")
+                # 启动时复位所有关节到默认位置
+                log.info("启动复位: 所有关节归位")
+                joint_ctrl.reset_all()
+                # 启动眨眼线程
+                BlinkThread(joint_ctrl).start()
+                # NeckThread(joint_ctrl).start()
+            else:
+                log.warning("舵机未连接，仅运行模拟显示模式")
+                face_display.set_status("模拟模式 - 无硬件连接")
+        except Exception as e:
+            log.error("舵机连接失败: %s", e)
 
 
         def _ensure_servo():
@@ -316,7 +335,7 @@ def main():
 
                 # 说话结束，复位嘴巴到闭合状态
                 log.info("说话结束，复位嘴巴")
-                # joint_ctrl.mouth_reset()
+                joint_ctrl.mouth_reset()
 
                 # 同步复位 GUI 滑杆
                 # face_display.reset_sliders()
@@ -360,14 +379,8 @@ def main():
             if not text:
                 continue
 
-            # 首次说话时连接舵机
+            # 首次说话时连接舵机（已在启动时连接，这里只是检查）
             _ensure_servo()
-
-            # 首次说话时启动后台线程
-            if connected and not bg_started:
-                # BlinkThread(joint_ctrl).start()
-                # NeckThread(joint_ctrl).start()
-                bg_started = True
 
             stop_event.clear()
             face_display.set_speaking(True)

@@ -106,7 +106,7 @@ class ServoController:
             buf[i] = prefix[i]
 
         # 3. 生成 ASCII 指令: #xxxPxxxxT1000!
-        cmd_str = f"#{servo_id:03d}P{pwm}T1000!"
+        cmd_str = f"#{servo_id:03d}P{pwm:04d}T1000!"
         cmd_bytes = cmd_str.encode('ascii')
 
         # 4. 填入缓冲区 (从第 8 字节开始)
@@ -145,10 +145,10 @@ class ServoController:
             log.error("设备未连接")
             return False
 
-        # 1. 生成指令: {#XXXP{pwm}T{time}!#XXXP{pwm}T{time}!}
+        # 1. 生成指令: {#XXXP{pwm:04d}T{time:04d}!#XXXP{pwm:04d}T{time:04d}!}
         cmd_parts = []
         for sid, pwm, time_ms in commands:
-            cmd_parts.append(f"#{sid:03d}P{pwm}T{time_ms:04d}!")
+            cmd_parts.append(f"#{sid:03d}P{pwm:04d}T{time_ms:04d}!")
         cmd_str = "{" + "".join(cmd_parts) + "}"
         cmd_bytes = cmd_str.encode('ascii')
 
@@ -217,14 +217,14 @@ if __name__ == "__main__":
     def test_servo_batch(t: float):
         # 测试1: 单包 (≤56字节) → cmd=00 00 00 00 01
         print(f"[单包测试] 1个舵机")
-        ctrl.send_pwm_batch([(9, 1300, 1000)])
+        ctrl.send_pwm_batch([(9, 1300, int(t*1000))])
         time.sleep(t)
     
         # 测试2: 多包 (>56字节) → cmd=00 00 00 6b 01
         print(f"[多包测试] 7个舵机 (114字节)")
         ctrl.send_pwm_batch([
-            (3,  1000, 1000), (4,  1300, 1000), (7,  1300, 1000),
-            (8,  1300, 1000), (10,  1300, 1000), (9,  1600, 100),
+            (3,  1000, int(t*1000)), (4,  1300, int(t*1000)), (7,  1300, int(t*1000)),
+            (8,  1300, int(t*1000)), (10,  1300, int(t*1000)), (9,  1600, int(t*1000)),
             (12, 1800, 100),
         ])
         time.sleep(t)
@@ -236,6 +236,14 @@ if __name__ == "__main__":
             (8,  1500, 500), (10,  1500, 500), (9,  1300, 500),
             (12, 1500, 500),
         ])
+    
+    def test_blink():
+        print("[眨眼测试]")
+        ctrl.send_pwm_batch([(8, 1800, 100), (11, 1100, 100)])
+        time.sleep(0.3)
+        ctrl.send_pwm_batch([(8, 1400, 100), (11, 1600, 100)])
+
+
 
     if ctrl.connect():
         try:
@@ -249,6 +257,9 @@ if __name__ == "__main__":
                     break
                 elif raw.lower() == 't':
                     test_servo(1)
+                    continue
+                elif raw.lower() == 'b':
+                    test_blink()
                     continue
 
                 parts = raw.split()

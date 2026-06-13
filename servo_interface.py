@@ -70,19 +70,20 @@ class ServoInterface:
         - clamp 到 min/max 范围
         返回校准后的 PWM（int）
         """
-        cfg = self.get_calibration(servo_id)
-        mn = cfg["min"]
-        mx = cfg["max"]
-        center = cfg["center"]
+        # cfg = self.get_calibration(servo_id)
+        # mn = cfg["min"]
+        # mx = cfg["max"]
+        # center = cfg["center"]
 
-        if cfg["reverse"]:
-            # 翻转：以 center 为轴镜像
-            flipped = 2 * center - raw_pwm
-            calibrated = max(mn, min(mx, flipped))
-        else:
-            calibrated = max(mn, min(mx, raw_pwm))
+        # if cfg["reverse"]:
+        #     # 翻转：以 center 为轴镜像
+        #     flipped = 2 * center - raw_pwm
+        #     calibrated = max(mn, min(mx, flipped))
+        # else:
+        #     calibrated = max(mn, min(mx, raw_pwm))
 
-        return int(calibrated)
+        # return int(calibrated)
+        return raw_pwm
 
     def norm_to_pwm(self, servo_id, norm):
         """
@@ -135,6 +136,20 @@ class ServoInterface:
             log.debug("unconnected send_pwm: S%d PWM=%d → 校准后=%d", servo_id, pwm, calibrated)
 
         return None
+
+    def send_batch(self, commands):
+        """
+        批量校准后发送多个舵机指令。
+        commands: list of (servo_id, pwm, duration_ms)
+        """
+        log.debug("send_batch:commands=%s", commands)
+        calibrated = [(sid, self.calibrate(sid, pwm), dur) for sid, pwm, dur in commands]
+        log.debug("send_batch:calibrated=%s", calibrated)
+        
+        if not self._ctrl or not self._ctrl.is_connected():
+            log.debug("未连接，跳过批量发送 %d 条", len(commands))
+            return False
+        return self._ctrl.send_pwm_batch(calibrated)
 
     def send_raw(self, servo_id, pwm):
         """不校准直接发送（调试用）"""
