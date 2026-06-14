@@ -36,9 +36,13 @@ from servo_interface import ServoInterface
 from joint_controller import JointController
 from servo_constants import S3_JAW, S4_SMILE_R, S5_SMILE_L, S6_LIP_UP
 
-# 命令行参数: python demo.py [lerp|spring]
-INTERP_MODE = sys.argv[1] if len(sys.argv) > 1 else "lerp"
-log.info("插值器模式: %s", INTERP_MODE)
+# 命令行参数: python demo.py [lerp|spring] [--headless]
+HEADLESS = "--headless" in sys.argv
+INTERP_MODE = "lerp"
+for arg in sys.argv[1:]:
+    if arg in ("lerp", "spring"):
+        INTERP_MODE = arg
+log.info("插值器模式: %s, 无头模式: %s", INTERP_MODE, HEADLESS)
 
 
 # ==========================
@@ -250,7 +254,7 @@ def main():
     threading.Thread(target=_load_voice_async, daemon=True).start()
     
     # ---- 创建 GUI（主线程运行 tkinter）----
-    face_display = FaceDisplay()
+    face_display = FaceDisplay(headless=HEADLESS)
     
     # ---- 创建插值器 ----
     interpolator = ServoInterpolator(mode=INTERP_MODE)
@@ -274,9 +278,13 @@ def main():
         nonlocal speak_thread, connected
 
         # 等 tkinter 就绪后赋值插值器（不连接舵机，避免阻塞 GUI）
-        while face_display.root is None:
-            time.sleep(0.01)
-        time.sleep(0.3)
+        # 无头模式下跳过此等待
+        if not HEADLESS:
+            while face_display.root is None:
+                time.sleep(0.01)
+            time.sleep(0.3)
+        else:
+            time.sleep(0.5)  # 无头模式等待初始化
         face_display.interpolator = interpolator
         
         # 立即启动硬件 tick 线程（内部有连接检查，无硬件也安全）

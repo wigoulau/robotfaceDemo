@@ -101,7 +101,11 @@ EAR_R_Y = 185
 class FaceDisplay:
     """面部模拟显示 (GUI 驱动)"""
 
-    def __init__(self):
+    def __init__(self, headless=False):
+        """
+        headless: 无头模式 (不创建 GUI，仅处理逻辑)
+        """
+        self.headless = headless
         self.queue = queue.Queue()       # 舵机 PWM 更新队列（原始目标值）
         self.text_queue = queue.Queue()  # 文本输入队列: "text" / "__stop__" / "__exit__"
         self.servo_cmd_queue = queue.Queue()  # 滑杆发出的舵机指令 (sid, pwm)
@@ -145,8 +149,93 @@ class FaceDisplay:
     def start(self):
         """启动 tkinter 窗口（应在主线程或专用线程调用，tkinter 会阻塞在此线程）"""
         self._running = True
-        self._tk_main()
+        if self.headless:
+            log.info("无头模式：跳过 GUI 初始化")
+            self._headless_main()
+        else:
+            self._tk_main()
         # _tk_main 在窗口关闭前不会返回
+
+    def _headless_main(self):
+        """无头模式主循环：仅处理队列消息，不创建 GUI"""
+        import time
+        log.info("无头模式运行中... (输入文本让机器人说话，输入 'q' 退出)")
+        
+        # 启动输入线程
+        input_thread = threading.Thread(target=self._headless_input, daemon=True)
+        input_thread.start()
+        
+        while self._running:
+            # 处理文本队列
+            try:
+                msg = self.text_queue.get(timeout=0.1)
+                if msg == "__exit__":
+                    break
+                elif msg == "__stop__":
+                    self._speaking = False
+                    log.info("停止说话")
+                else:
+                    log.debug("收到文本: %s", msg[:30])
+            except queue.Empty:
+                pass
+            
+            # 处理舵机更新队列
+            try:
+                while True:
+                    servo_id, pwm = self.queue.get_nowait()
+                    # 无头模式下仅记录，不发送
+                    log.debug("S%d PWM=%d", servo_id, pwm)
+            except queue.Empty:
+                pass
+            
+            time.sleep(0.01)
+    
+    def _headless_input(self):
+        """无头模式下的文本输入线程"""
+        import time
+        time.sleep(1)  # 等待初始化完成
+        
+        print("\n" + "="*50)
+        print("机器人语音交互模式")
+        print("="*50)
+        print("输入文本让机器人说话，命令：")
+        print("  q     - 退出程序")
+        print("  s     - 停止当前说话")
+        print("  help  - 显示帮助")
+        print("="*50 + "\n")
+        
+        while self._running:
+            try:
+                text = input(">> ").strip()
+                
+                if not text:
+                    continue
+                elif text.lower() == 'q':
+                    log.info("退出命令")
+                    self.text_queue.put("__exit__")
+                    self._running = False
+                    break
+                elif text.lower() == 's':
+                    log.info("停止命令")
+                    self.text_queue.put("__stop__")
+                elif text.lower() == 'help':
+                    print("命令说明：")
+                    print("  直接输入文本 - 机器人说话")
+                    print("  q           - 退出")
+                    print("  s           - 停止说话")
+                    print("  help        - 显示帮助")
+                else:
+                    log.info("用户输入: %s", text)
+                    self.text_queue.put(text)
+                    
+            except EOFError:
+                log.info("输入结束")
+                break
+            except KeyboardInterrupt:
+                log.info("键盘中断")
+                break
+            except Exception as e:
+                log.error("输入异常: %s", e)
 
     def start_in_thread(self):
         """在后台线程中启动（窗口关闭前线程不退出）"""
@@ -203,9 +292,15 @@ class FaceDisplay:
     # ---- 设置说话状态（线程安全，通过队列）----
     def set_speaking(self, speaking):
         self._speaking = speaking
+        if self.headless:
+            log.info("说话状态: %s", "开始" if speaking else "结束")
+            return
         self.ui_cmd_queue.put(("speaking", speaking))
 
     def set_status(self, text):
+        if self.headless:
+            log.info("状态: %s", text)
+            return
         self.ui_cmd_queue.put(("status", text))
 
     # ---- 外部调用：获取滑杆发出的舵机指令 ----
@@ -219,6 +314,8 @@ class FaceDisplay:
     # ---- 外部调用：复位所有滑杆到中心值（线程安全，通过队列）----
     def reset_sliders(self):
         """复位所有滑杆到中心值"""
+        if self.headless:
+            return  # 无头模式下无滑杆
         self.ui_cmd_queue.put(("reset_sliders", None))
 
     # ==============================
