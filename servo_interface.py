@@ -157,6 +157,18 @@ class ServoInterface:
             return False
         return self._ctrl.send_pwm(servo_id, int(pwm))
 
+    def send_command(self, cmd_str):
+        """发送原始字符串指令（如 $DST!）"""
+        if not self._ctrl or not self._ctrl.is_connected():
+            log.debug("未连接，跳过发送命令: %s", cmd_str)
+            return False
+        return self._ctrl.send_command(cmd_str)
+
+    # 所有舵机停止在当前位置
+    def send_stop(self):
+        """发送停止命令 $DST!"""
+        return self.send_command("$DST!")
+
 
 # ==============================
 # 快速测试
@@ -165,16 +177,18 @@ if __name__ == "__main__":
     log.info("=== ServoInterface 校准测试 ===")
 
     iface = ServoInterface()
+    iface.connect()
+    iface.send_stop()
 
     # 测试校准（无硬件连接场景）
     # S3 jaw: min=1000 center=1450 max=1450 reverse=True
-    log.info("S3 jaw raw=1200 → calibrated=%d (reverse, clamp)", iface.calibrate(3, 1200))
-    log.info("S3 jaw raw=1500 → calibrated=%d (超过max)", iface.calibrate(3, 1500))
-    log.info("S4 smile_r raw=1500 → calibrated=%d (无翻转)", iface.calibrate(4, 1500))
-    log.info("S4 smile_r raw=1000 → calibrated=%d (低于min)", iface.calibrate(4, 1000))
+    # log.info("S3 jaw raw=1200 → calibrated=%d (reverse, clamp)", iface.calibrate(3, 1200))
+    # log.info("S3 jaw raw=1500 → calibrated=%d (超过max)", iface.calibrate(3, 1500))
+    # log.info("S4 smile_r raw=1500 → calibrated=%d (无翻转)", iface.calibrate(4, 1500))
+    # log.info("S4 smile_r raw=1000 → calibrated=%d (低于min)", iface.calibrate(4, 1000))
 
-    # 测试 norm → pwm
-    log.info("S3 norm=0.0 → pwm=%d (反向, 0=最开)", iface.norm_to_pwm(3, 0.0))
-    log.info("S3 norm=1.0 → pwm=%d (反向, 1=闭合)", iface.norm_to_pwm(3, 1.0))
-    log.info("S4 norm=0.0 → pwm=%d (正向, 0=最小)", iface.norm_to_pwm(4, 0.0))
-    log.info("S4 norm=1.0 → pwm=%d (正向, 1=最大)", iface.norm_to_pwm(4, 1.0))
+    # # 测试 norm → pwm
+    # log.info("S3 norm=0.0 → pwm=%d (反向, 0=最开)", iface.norm_to_pwm(3, 0.0))
+    # log.info("S3 norm=1.0 → pwm=%d (反向, 1=闭合)", iface.norm_to_pwm(3, 1.0))
+    # log.info("S4 norm=0.0 → pwm=%d (正向, 0=最小)", iface.norm_to_pwm(4, 0.0))
+    # log.info("S4 norm=1.0 → pwm=%d (正向, 1=最大)", iface.norm_to_pwm(4, 1.0))

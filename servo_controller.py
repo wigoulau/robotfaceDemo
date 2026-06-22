@@ -186,6 +186,38 @@ class ServoController:
             log.error("BATCH %s  %s", cmd_str, e)
             return False
 
+    def send_command(self, cmd_str):
+        """
+        发送一条原始字符串指令（如 $DST!）。
+        :param cmd_str: ASCII 指令字符串
+        :return: True/False
+        """
+        if not self.device:
+            log.error("设备未连接")
+            return False
+
+        buf = [0x00] * 64
+        prefix = [0x02, 0x02, 0x14, 0x00, 0x00, 0x00, 0x00, 0x01]
+        for i in range(len(prefix)):
+            buf[i] = prefix[i]
+
+        cmd_bytes = cmd_str.encode('ascii')
+        for i, b in enumerate(cmd_bytes):
+            buf[8 + i] = b
+        buf[8 + len(cmd_bytes)] = 0x00
+
+        try:
+            result = self.device.write(buf)
+            if result and result > 0:
+                log.debug("CMD %s", cmd_str)
+                return True
+            else:
+                log.warning("CMD %s result=%s", cmd_str, result)
+                return False
+        except Exception as e:
+            log.error("CMD %s  %s", cmd_str, e)
+            return False
+
     def close(self):
         """关闭设备连接"""
         if self.device:

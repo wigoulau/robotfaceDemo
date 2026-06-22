@@ -295,11 +295,15 @@ def main():
             connected = servo_iface.connect()
             if connected:
                 log.info("舵机连接成功")
+                # 先发送停止命令，中断舵机当前动作
+                log.info("发送 $DST! 停止舵机动作")
+                servo_iface.send_stop()
+                time.sleep(0.5)
                 # 启动时复位所有关节到默认位置
                 log.info("启动复位: 所有关节归位")
                 joint_ctrl.reset_all()
                 # 启动眨眼线程
-                BlinkThread(joint_ctrl).start()
+                # BlinkThread(joint_ctrl).start()
                 # NeckThread(joint_ctrl).start()
             else:
                 log.warning("舵机未连接，仅运行模拟显示模式")
